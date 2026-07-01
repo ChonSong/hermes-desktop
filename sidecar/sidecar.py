@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Hermes Desktop sidecar — manages Docker container lifecycle.
+"""Hermes Desktop sidecar — manages Docker container lifecycle via HTTP.
 
 Listens on 127.0.0.1:17887. Provides:
-  GET  /health            — sidecar + container status
+  GET  /health            — sidecar + container status (JSON)
   POST /container/start   — start the desktop container via docker compose
   POST /container/stop    — stop the desktop container
-  GET  /container/status  — container state detail
+  GET  /container/status  — container state detail (JSON)
 """
 
 import asyncio
@@ -17,19 +17,13 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    from websockets.asyncio.server import serve
-except ImportError:
-    print("Install websockets: pip install websockets")
-    sys.exit(1)
-
 HOST = os.environ.get("HERMES_DESKTOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERMES_DESKTOP_PORT", "17887"))
 COMPOSE_DIR = Path(__file__).resolve().parent.parent / "docker"
 COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
 CONTAINER_NAME = "hermes-desktop"
-VNC_PORT = 5900
-NOVNC_PORT = 6080
+VNC_PORT = 6900
+NOVNC_PORT = 6901
 
 
 def _compose(args: list[str]) -> subprocess.CompletedProcess:
@@ -52,10 +46,7 @@ def container_status() -> dict:
             "running": st.get("Running", False),
             "state": st.get("Status", "unknown"),
             "started_at": st.get("StartedAt", ""),
-            "ports": {
-                "vnc": VNC_PORT,
-                "novnc": NOVNC_PORT,
-            }
+            "ports": {"vnc": VNC_PORT, "novnc": NOVNC_PORT},
         }
     except Exception as exc:
         return {"running": False, "state": "error", "error": str(exc)}
@@ -66,14 +57,14 @@ def start_container() -> dict:
     # Build first (idempotent — fast on repeats)
     r = _compose(["build", "--pull"])
     if r.returncode != 0:
-        return {"status": "error", "step": "build", "detail": r.stderr[-200:]}
+        return {"status": "error", "step": "build", "detail": r.stderr[-300:]}
 
     # Start
     r = _compose(["up", "-d", "--wait"])
     if r.returncode != 0:
-        return {"status": "error", "step": "up", "detail": r.stderr[-200:]}
+        return {"status": "error", "step": "up", "detail": r.stderr[-300:]}
 
-    # Wait for VNC to be ready
+    # Wait for ready
     for _ in range(30):
         cs = container_status()
         if cs["running"]:
@@ -87,16 +78,13 @@ def stop_container() -> dict:
     """Stop the desktop container."""
     r = _compose(["down", "--timeout", "10"])
     if r.returncode != 0:
-        # If the container was removed manually, "down" may fail — just
-        # check if it's gone and treat that as success.
         if container_status().get("state") == "not-found":
             return {"status": "stopped"}
-        return {"status": "error", "detail": r.stderr[-200:]}
+        return {"status": "error", "detail": r.stderr[-300:]}
     return {"status": "stopped"}
 
 
-def build_response(status: int, body: dict) -> bytes:
-    """Build a minimal HTTP response."""
+def json_response(status: int, body: dict) -> bytes:
     payload = json.dumps(body, indent=2).encode()
     return (
         f"HTTP/1.1 {status} OK\r\n"
@@ -108,23 +96,27 @@ def build_response(status: int, body: dict) -> bytes:
     ).encode() + payload
 
 
-async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        request = await asyncio.wait_for(reader.read(4096), timeout=10)
+        data = await asyncio.wait_for(reader.read(4096), timeout=10)
     except asyncio.TimeoutError:
         writer.close()
         return
 
-    if not request:
+    if not data:
         writer.close()
         return
 
-    line0 = request.split(b"\r\n")[0].decode("utf-8", errors="replace")
-    parts = line0.split()
+    request = data.decode("utf-8", errors="replace")
+    lines = request.split("\r\n")
+    if not lines:
+        writer.close()
+        return
+
+    parts = lines[0].split()
     if len(parts) < 2:
         writer.close()
         return
-
     method, path = parts[0], parts[1]
 
     # CORS preflight
@@ -149,37 +141,32 @@ async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 "message": "sidecar running",
                 "container_detail": cs,
             }
-
         elif method == "GET" and path == "/container/status":
             body = container_status()
-
         elif method == "POST" and path == "/container/start":
             body = start_container()
-
         elif method == "POST" and path == "/container/stop":
             body = stop_container()
-
         else:
-            body = {"error": "not found", "path": path}
-            writer.write(build_response(404, body))
+            writer.write(json_response(404, {"error": "not found", "path": path}))
             await writer.drain()
             writer.close()
             return
 
-        writer.write(build_response(200, body))
-
+        writer.write(json_response(200, body))
     except Exception as exc:
-        body = {"error": str(exc)}
-        writer.write(build_response(500, body))
+        writer.write(json_response(500, {"error": str(exc)}))
 
     await writer.drain()
     writer.close()
 
 
 async def main():
-    print(f"[sidecar] binding {HOST}:{PORT}")
+    server = await asyncio.start_server(handle, HOST, PORT)
+    addr = server.sockets[0].getsockname()
+    print(f"[sidecar] HTTP server listening on {addr[0]}:{addr[1]}")
     print(f"[sidecar] compose file: {COMPOSE_FILE}")
-    async with serve(handler, HOST, PORT) as server:
+    async with server:
         await server.serve_forever()
 
 
