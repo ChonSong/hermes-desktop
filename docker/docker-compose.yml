@@ -1,0 +1,20 @@
+services:
+  hermes-desktop:
+    container_name: hermes-desktop
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:5900:5900"   # TigerVNC (host-only)
+      - "127.0.0.1:6080:6080"   # noVNC + websockify (host-only)
+    environment:
+      - DISPLAY=:1
+      - RESOLUTION=1280x720
+    volumes:
+      - desktop-home:/home/user    # Persistent home directory
+      - /tmp/.X11-unix:/tmp/.X11-unix  # Optional: X11 sharing
+    restart: unless-stopped
+    shm_size: 2gb
+
+volumes:
+  desktop-home:
